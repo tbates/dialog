@@ -4,6 +4,7 @@
 //
 
 #import "Dialog2.h"
+#include <string.h>
 
 static double const AppVersion = 2.0;
 
@@ -40,6 +41,34 @@ int open_pipe (char const* name, int oflag)
 		exit(EX_IOERR);
 	}
 	return fd;
+}
+
+// An stdin that reaches EOF without yielding a byte (a command run with
+// input “none”, “< /dev/null”, or a terminal) leaves the server reading an
+// empty pipe. On macOS 27 that read has been observed to never return
+// (textmate#108). Sending a minimal empty plist keeps the downstream result
+// identical — parameters starts from an empty dictionary either way — while
+// giving the server the byte flow its EOF handling expects. Input that does
+// arrive (e.g. popup suggestions) is forwarded untouched.
+static char const* kEmptyPlist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
+
+static void write_all (int fd, char const* buf, size_t len)
+{
+	while(len > 0)
+	{
+		ssize_t n = write(fd, buf, len);
+		if(n <= 0)
+			break;
+		buf += n;
+		len -= n;
+	}
+}
+
+static void close_input_fd (int inputFd, size_t stdinBytesForwarded)
+{
+	if(stdinBytesForwarded == 0)
+		write_all(inputFd, kEmptyPlist, strlen(kEmptyPlist));
+	close(inputFd);
 }
 
 int main (int argc, char const* argv[])
@@ -94,9 +123,10 @@ int main (int argc, char const* argv[])
 		if(isatty(STDIN_FILENO) != 0)
 		{
 			fdMap.erase(fdMap.find(STDIN_FILENO));
-			close(inputFd);
+			close_input_fd(inputFd, 0);
 		}
 
+		size_t stdinBytesForwarded = 0;
 		while(fdMap.size() > 1 || (fdMap.size() == 1 && fdMap.find(STDIN_FILENO) == fdMap.end()))
 		{
 			fd_set readfds, writefds;
@@ -126,14 +156,19 @@ int main (int argc, char const* argv[])
 
 					if(len == 0)
 							toRemove.push_back(pair.first); // we can’t remove as long as we need the iterator for the ++
-					else	write(pair.second, buf, len);
+					else
+					{
+						if(pair.first == STDIN_FILENO)
+							stdinBytesForwarded += len;
+						write(pair.second, buf, len);
+					}
 				}
 			}
 
 			for(int key : toRemove)
 			{
 				if(fdMap[key] == inputFd)
-					close(inputFd);
+					close_input_fd(inputFd, stdinBytesForwarded);
 				fdMap.erase(key);
 			}
 		}
